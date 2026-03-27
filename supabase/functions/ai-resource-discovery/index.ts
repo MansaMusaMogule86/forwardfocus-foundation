@@ -89,47 +89,15 @@ ${JSON.stringify(resourceContext, null, 2)}
 
 Remember: You are the hub for second chances. Provide verified, structured resource information.`;
 
-    const aiResponse = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
-        'HTTP-Referer': 'https://forwardfocuselevation.org',
-        'X-Title': 'Forward Focus Elevation',
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'qwen/qwen3-next-80b-a3b-instruct:free',
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: query }
-        ],
-        stream: false,
-        max_tokens: 800,
-      }),
+    const { content: aiResponseText } = await fetchWithFallback({
+      apiKey: OPENROUTER_API_KEY,
+      models: ['qwen/qwen3-next-80b-a3b-instruct:free', 'meta-llama/llama-3.3-70b-instruct:free'],
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: query }
+      ],
+      maxTokens: 800,
     });
-
-    if (!aiResponse.ok) {
-      console.error('OpenRouter API error:', aiResponse.status, await aiResponse.text());
-
-      const helpfulGuidance = `I'm here to help you find Ohio resources! While my AI is temporarily unavailable, I've found ${resources?.length || 0} resources from our database that might help.
-
-**Tips for better results:**
-• Be specific about your location (city or county in Ohio)
-• Mention the type of help you need (housing, employment, healthcare, legal aid, etc.)
-
-Here are the resources I found for you:`;
-
-      return new Response(JSON.stringify({
-        response: helpfulGuidance,
-        resources: resources?.slice(0, limit) || [],
-        totalFound: resources?.length || 0
-      }), {
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      });
-    }
-
-    const aiData = await aiResponse.json();
-    const aiResponseText = aiData.choices[0].message.content;
     const relevantResources = resources?.slice(0, limit) || [];
 
     return new Response(JSON.stringify({

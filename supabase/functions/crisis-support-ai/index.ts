@@ -96,68 +96,12 @@ Remember: You are the companion for second chances and healing. Provide verified
       { role: 'user', content: query }
     ];
 
-    const aiResponse = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
-        'HTTP-Referer': 'https://forwardfocuselevation.org',
-        'X-Title': 'Forward Focus Elevation',
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'google/gemma-3-27b-it:free',
-        messages,
-        stream: false,
-        max_tokens: 1000,
-      }),
+    const { content: aiMessage } = await fetchWithFallback({
+      apiKey: OPENROUTER_API_KEY,
+      models: ['google/gemma-3-27b-it:free', 'meta-llama/llama-3.3-70b-instruct:free'],
+      messages,
+      maxTokens: 1000,
     });
-
-    // Filter relevant resources
-    const relevantResources = resources?.filter(resource => {
-      const queryLower = query.toLowerCase();
-      const resourceType = resource.type?.toLowerCase() || '';
-      if (queryLower.includes('suicide') || queryLower.includes('self-harm')) {
-        return resourceType.includes('crisis') || resourceType.includes('mental health');
-      }
-      if (queryLower.includes('domestic violence') || queryLower.includes('abuse')) {
-        return resourceType.includes('domestic violence') || resourceType.includes('crisis');
-      }
-      if (queryLower.includes('addiction') || queryLower.includes('substance')) {
-        return resourceType.includes('substance abuse') || resourceType.includes('mental health');
-      }
-      return resourceType.includes('crisis') || resourceType.includes('emergency');
-    })?.slice(0, 8) || [];
-
-    if (!aiResponse.ok) {
-      console.error('OpenRouter API error:', aiResponse.status, await aiResponse.text());
-
-      if (aiResponse.status === 429 || aiResponse.status === 402) {
-        // Still provide fallback with resources
-      }
-
-      const compassionateResponse = `I'm here with you, and I want you to know that you're not alone. While I'm having some technical difficulties right now, your wellbeing is my priority.
-
-**If you're in immediate danger, please call 911 right now.**
-
-**For crisis support:**
-• 988 - Suicide & Crisis Lifeline (available 24/7)
-• Text HOME to 741741 - Crisis Text Line
-• 1-800-799-7233 - National Domestic Violence Hotline
-
-I'm searching for local Ohio resources that can provide you with immediate support...`;
-
-      return new Response(JSON.stringify({
-        response: compassionateResponse,
-        resources: relevantResources,
-        urgencyLevel,
-        totalResources: resources?.length || 0
-      }), {
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      });
-    }
-
-    const aiData = await aiResponse.json();
-    const aiMessage = aiData.choices[0].message.content;
 
     return new Response(JSON.stringify({
       response: aiMessage,

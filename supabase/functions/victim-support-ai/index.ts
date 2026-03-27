@@ -95,29 +95,12 @@ Remember: You are the guide for healing and second chances. Provide verified, st
       { role: 'user', content: query }
     ];
 
-    const aiResponse = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
-        'HTTP-Referer': 'https://forwardfocuselevation.org',
-        'X-Title': 'Forward Focus Elevation',
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'nousresearch/hermes-3-405b-instruct:free',
-        messages,
-        stream: false,
-        max_tokens: 1200,
-      }),
+    const { content: aiMessage } = await fetchWithFallback({
+      apiKey: OPENROUTER_API_KEY,
+      models: ['nousresearch/hermes-3-405b-instruct:free', 'meta-llama/llama-3.3-70b-instruct:free'],
+      messages,
+      maxTokens: 1200,
     });
-
-    if (!aiResponse.ok) {
-      console.error('OpenRouter API error:', aiResponse.status, await aiResponse.text());
-      throw new Error('Failed to generate AI response');
-    }
-
-    const aiData = await aiResponse.json();
-    const aiMessage = aiData.choices[0].message.content;
 
     // Filter resources
     const relevantResources = resources?.filter(resource => {

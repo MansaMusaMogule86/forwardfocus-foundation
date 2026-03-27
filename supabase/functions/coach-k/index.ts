@@ -91,52 +91,13 @@ Remember: You are the hub for second chances. Provide clear, actionable, and com
 
     console.log(`Processing Coach K chat request with ${messages.length} messages`);
 
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
-        'HTTP-Referer': 'https://forwardfocuselevation.org',
-        'X-Title': 'Forward Focus Elevation',
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'meta-llama/llama-3.3-70b-instruct:free',
-        messages: openAIMessages,
-        stream: false,
-        temperature: 0.7,
-        max_tokens: 1000,
-      }),
+    const { content } = await fetchWithFallback({
+      apiKey: OPENROUTER_API_KEY,
+      models: ['meta-llama/llama-3.3-70b-instruct:free', 'google/gemma-3-27b-it:free'],
+      messages: openAIMessages,
+      maxTokens: 1000,
+      temperature: 0.7,
     });
-
-    if (!response.ok) {
-      const error = await response.text();
-      console.error('OpenRouter API error:', response.status, error);
-
-      if (response.status === 429) {
-        return new Response(JSON.stringify({
-          response: "Our AI service is temporarily busy. Please try again in a moment. Need immediate help? Call 988 for crisis support or 211 for resources.",
-          rateLimitExceeded: true,
-          remaining: 0
-        }), {
-          status: 429,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-        });
-      }
-      if (response.status === 402) {
-        return new Response(JSON.stringify({
-          response: "Our AI service is temporarily unavailable. Please try again later. For immediate support, call 988 or 211.",
-          remaining: 0
-        }), {
-          status: 402,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-        });
-      }
-
-      throw new Error(`OpenRouter API error: ${response.status}`);
-    }
-
-    const data = await response.json();
-    const content = data.choices?.[0]?.message?.content || '';
 
     return new Response(JSON.stringify({
       response: content,

@@ -94,29 +94,12 @@ Remember: Safety first. Your role is to stabilize and connect users with verifie
       { role: 'user', content: query }
     ];
 
-    const aiResponse = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
-        'HTTP-Referer': 'https://forwardfocuselevation.org',
-        'X-Title': 'Forward Focus Elevation',
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'google/gemma-3-27b-it:free',
-        messages,
-        stream: false,
-        max_tokens: 1000,
-      }),
+    const { content: aiMessage } = await fetchWithFallback({
+      apiKey: OPENROUTER_API_KEY,
+      models: ['google/gemma-3-27b-it:free', 'meta-llama/llama-3.3-70b-instruct:free'],
+      messages,
+      maxTokens: 1000,
     });
-
-    if (!aiResponse.ok) {
-      console.error('OpenRouter API error:', aiResponse.status, await aiResponse.text());
-      throw new Error('Failed to generate AI response');
-    }
-
-    const aiData = await aiResponse.json();
-    const aiMessage = aiData.choices[0].message.content;
 
     const relevantResources = resources?.filter(resource => {
       const queryLower = query.toLowerCase();
