@@ -2,6 +2,7 @@ import "https://deno.land/x/xhr@0.1.0/mod.ts";
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 import { checkAiRateLimit } from '../_shared/rate-limit.ts';
+import { fetchWithFallback } from '../_shared/openrouter.ts';
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -78,43 +79,13 @@ serve(async (req) => {
 
     console.log(`Processing ${topic} chat request with ${messages.length} messages`);
 
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
-        'HTTP-Referer': 'https://forwardfocuselevation.org',
-        'X-Title': 'Forward Focus Elevation',
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'meta-llama/llama-3.3-70b-instruct:free',
-        messages: openAIMessages,
-        stream: false,
-        temperature: 0.7,
-        max_tokens: 1000,
-      }),
+    const { content } = await fetchWithFallback({
+      apiKey: OPENROUTER_API_KEY,
+      models: ['meta-llama/llama-3.3-70b-instruct:free', 'google/gemma-3-27b-it:free'],
+      messages: openAIMessages,
+      maxTokens: 1000,
+      temperature: 0.7,
     });
-
-    if (!response.ok) {
-      const error = await response.text();
-      console.error('OpenRouter API error:', response.status, error);
-
-      if (response.status === 429) {
-        return new Response(JSON.stringify({ error: 'AI service is temporarily busy. Please try again in a moment.' }), {
-          status: 429, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-        });
-      }
-      if (response.status === 402) {
-        return new Response(JSON.stringify({ error: 'AI service temporarily unavailable.' }), {
-          status: 402, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-        });
-      }
-
-      throw new Error(`OpenRouter API error: ${response.status}`);
-    }
-
-    const data = await response.json();
-    const content = data.choices?.[0]?.message?.content || '';
 
     return new Response(
       JSON.stringify({ response: content }),
