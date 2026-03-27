@@ -21,7 +21,7 @@ export const AIWithTrial = ({ children, aiEndpoint, className = "" }: AIWithTria
   const { sessionState, checkTrialAccess, transferToUser } = useAnonymousSession();
   const [showTrialExpired, setShowTrialExpired] = useState(false);
   const [canUseAI, setCanUseAI] = useState(false);
-  const [turnsRemaining, setTurnsRemaining] = useState(5);
+  const [turnsRemaining, setTurnsRemaining] = useState(10);
 
   // Check access function
   const checkAccess = useCallback(async (): Promise<boolean> => {

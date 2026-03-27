@@ -5,7 +5,7 @@ import { checkAiRateLimit } from '../_shared/rate-limit.ts';
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version',
 };
 
 interface ReentryQuery {
@@ -32,12 +32,15 @@ serve(async (req) => {
   const supabase = createClient(supabaseUrl, supabaseKey);
 
   try {
-    // Rate limiting check
+    const OPENROUTER_API_KEY = Deno.env.get('OPENROUTER_API_KEY');
+    if (!OPENROUTER_API_KEY) {
+      throw new Error('OPENROUTER_API_KEY is not configured');
+    }
+
     const rateLimit = await checkAiRateLimit(supabase, req, 'reentry-navigator-ai');
-    
     if (rateLimit.limited) {
       return new Response(JSON.stringify({
-        error: "You've reached your daily limit for free AI consultations. To get unlimited access to our AI tools and specialized coaching, please sign in.",
+        error: "You've reached your daily limit for free AI consultations. To get unlimited access, please sign in.",
         supportMessage: 'For immediate reentry support, please call 211 for resource navigation.',
         rateLimitExceeded: true
       }), {
@@ -48,7 +51,6 @@ serve(async (req) => {
 
     const { query, location, county, reentryStage = 'recently_released', priorityNeeds = [], selectedCoach, previousContext = [] }: ReentryQuery = await req.json();
 
-    // Enhanced resource filtering for reentry services
     let resourceQuery = supabase
       .from('resources')
       .select('*')
@@ -67,7 +69,6 @@ serve(async (req) => {
       throw new Error('Failed to fetch resources');
     }
 
-    // Get coach-specific system prompt or default
     const systemPrompt = getCoachSystemPrompt(selectedCoach, resources?.slice(0, 12) || []);
 
     const messages = [
@@ -76,123 +77,62 @@ serve(async (req) => {
       { role: 'user', content: query }
     ];
 
-    const LOVABLE_API_KEY = Deno.env.get('LOVABLE_API_KEY');
-    if (!LOVABLE_API_KEY) {
-      throw new Error('LOVABLE_API_KEY is not configured');
-    }
-
-    const openAIResponse = await fetch('https://ai.gateway.lovable.dev/v1/chat/completions', {
+    const aiResponse = await fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${LOVABLE_API_KEY}`,
+        'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+        'HTTP-Referer': 'https://forwardfocuselevation.org',
+        'X-Title': 'Forward Focus Elevation',
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: 'google/gemini-2.5-flash',
+        model: 'nvidia/llama-3.1-nemotron-70b-instruct:free',
         messages,
+        stream: false,
         max_tokens: 1500,
       }),
     });
 
-    if (!openAIResponse.ok) {
-      if (openAIResponse.status === 429) {
-        return new Response(JSON.stringify({ error: "AI rate limit exceeded. Please try again shortly." }), {
-          status: 429,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    if (!aiResponse.ok) {
+      if (aiResponse.status === 429) {
+        return new Response(JSON.stringify({ error: "AI service is temporarily busy. Please try again in a moment." }), {
+          status: 429, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
         });
       }
-      if (openAIResponse.status === 402) {
+      if (aiResponse.status === 402) {
         return new Response(JSON.stringify({ error: "AI service temporarily unavailable. Please try again later." }), {
-          status: 402,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          status: 402, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
         });
       }
-      console.error('AI gateway error:', openAIResponse.status, await openAIResponse.text());
+      console.error('OpenRouter error:', aiResponse.status, await aiResponse.text());
       throw new Error('Failed to generate AI response');
     }
 
-    const aiData = await openAIResponse.json();
+    const aiData = await aiResponse.json();
     const aiMessage = aiData.choices[0].message.content;
 
-    // Web Search Fallback (Perplexity)
-    let webResources: any[] = [];
-    const minResources = 3;
-    if ((resources?.length || 0) < minResources) {
-      try {
-        const perplexityResponse = await fetch('https://api.perplexity.ai/chat/completions', {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${Deno.env.get('PERPLEXITY_API_KEY')}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            model: 'llama-3.1-sonar-small-128k-online',
-            messages: [
-              { role: 'system', content: 'You are a reentry resource finder. Find verified Ohio organizations (name, phone, website, description) that help justice-impacted individuals and return as JSON.' },
-              { role: 'user', content: `Ohio reentry support for ${query} ${location ? 'near ' + location : ''} ${county ? 'in ' + county + ' County' : ''}` }
-            ],
-            max_tokens: 1000
-          }),
-        });
-
-        if (perplexityResponse.ok) {
-          const webData = await perplexityResponse.json();
-          webResources = [{
-            name: 'Latest Web Resources',
-            description: webData.choices[0].message.content,
-            type: 'web_search',
-            source: 'perplexity'
-          }];
-        }
-      } catch (err) {
-        console.error('Web search error:', err);
-      }
-    }
-
-    // Filter resources based on reentry needs
     const relevantResources = resources?.filter(resource => {
       const queryLower = query.toLowerCase();
-      const resourceName = resource.name?.toLowerCase() || '';
-      const resourceDesc = resource.description?.toLowerCase() || '';
       const resourceType = resource.type?.toLowerCase() || '';
-      
-      // Reentry-specific resource matching
-      if (queryLower.includes('housing') || queryLower.includes('shelter') || queryLower.includes('apartment')) {
-        return resourceType.includes('housing') || resourceType.includes('transitional');
-      }
-      if (queryLower.includes('job') || queryLower.includes('employment') || queryLower.includes('work')) {
-        return resourceType.includes('employment') || resourceType.includes('job training') || resource.justice_friendly;
-      }
-      if (queryLower.includes('legal') || queryLower.includes('expungement') || queryLower.includes('court')) {
-        return resourceType.includes('legal aid') || resourceType.includes('advocacy');
-      }
-      if (queryLower.includes('education') || queryLower.includes('school') || queryLower.includes('college')) {
-        return resourceType.includes('education') || resourceType.includes('training');
-      }
-      if (queryLower.includes('healthcare') || queryLower.includes('medical') || queryLower.includes('mental health')) {
-        return resourceType.includes('healthcare') || resourceType.includes('mental health');
-      }
-      if (queryLower.includes('family') || queryLower.includes('children') || queryLower.includes('parenting')) {
-        return resourceType.includes('family') || resourceType.includes('support');
-      }
-      
-      return resourceName.includes(queryLower) || 
-             resourceDesc.includes(queryLower) || 
-             resourceType.includes('reentry') ||
-             resource.justice_friendly;
+      if (queryLower.includes('housing') || queryLower.includes('shelter')) return resourceType.includes('housing') || resourceType.includes('transitional');
+      if (queryLower.includes('job') || queryLower.includes('employment')) return resourceType.includes('employment') || resourceType.includes('job training') || resource.justice_friendly;
+      if (queryLower.includes('legal') || queryLower.includes('expungement')) return resourceType.includes('legal aid') || resourceType.includes('advocacy');
+      if (queryLower.includes('education') || queryLower.includes('school')) return resourceType.includes('education') || resourceType.includes('training');
+      if (queryLower.includes('healthcare') || queryLower.includes('mental health')) return resourceType.includes('healthcare') || resourceType.includes('mental health');
+      if (queryLower.includes('family') || queryLower.includes('children')) return resourceType.includes('family') || resourceType.includes('support');
+      return resourceType.includes('reentry') || resource.justice_friendly;
     })?.slice(0, 10) || [];
 
     return new Response(JSON.stringify({
       response: aiMessage,
       resources: relevantResources,
-      webResources,
       reentryStage,
       priorityNeeds,
       totalResources: resources?.length || 0,
       rateLimitRemaining: rateLimit.remaining - 1,
       keyServices: {
         housing: "Transitional and permanent housing options",
-        employment: "Job training and fair-chance employers", 
+        employment: "Job training and fair-chance employers",
         legal: "Expungement and legal document assistance",
         education: "GED, college, and vocational training",
         support: "211 Ohio comprehensive resource navigation"
@@ -217,7 +157,6 @@ serve(async (req) => {
   }
 });
 
-// Add coach-specific system prompt function
 function getCoachSystemPrompt(coach?: { name: string; specialty: string; description: string; }, resources: any[] = []): string {
   const basePrompt = `You are Coach Kay, the lead navigator for "The Collective" (AI & Life Transformation Hub) at Forward Focus Elevation. You serve all 88 counties across Ohio, specializing in AI & Life Transformation for individuals seeking a second chance.
 
@@ -228,7 +167,7 @@ function getCoachSystemPrompt(coach?: { name: string; specialty: string; descrip
 - Avoid conversational filler. Provide pure, structured, and informative output.
 
 ### Core Principles
-1. **Guided Interaction**: Always ask exactly ONE guided question at the end of your response to lead the user through their discovery or transformation process.
+1. **Guided Interaction**: Always ask exactly ONE guided question at the end of your response.
 2. **Transformation Expertise**: Provide guidance on housing, employment, legal aid, mindfulness-based success, financial foundations, and AI-driven growth.
 3. **Ohio-Wide Support**: Ensure coverage across all 88 Ohio counties, prioritizing Columbus/Franklin County when applicable.
 4. **Resource Richness**: Connect users with verified, justice-friendly resources. Include contact info for all recommendations.
@@ -240,123 +179,18 @@ ${JSON.stringify(resources)}
 - For mental health crises, direct to 988 Suicide & Crisis Lifeline.
 - Focus on empowerment, dignity, and self-advocacy.
 
-Remember: You are the guide for second chances and AI-driven life transformation. Be the "Google and Perplexity" for justice-impacted individuals by providing verified, structured resource information.`;
+Remember: You are the guide for second chances and AI-driven life transformation. Provide verified, structured resource information.`;
 
   if (!coach) return basePrompt;
 
-  // Coach-specific personality additions
   const coachPrompts: Record<string, string> = {
-    'Coach Dana': `
-
-**As Coach Dana - Housing Transition Specialist:**
-I'm your dedicated housing advocate. I understand the unique challenges of finding stable housing with a criminal record. My approach is practical, patient, and focused on securing safe housing solutions.
-
-**My Specialty Focus:**
-- Transitional and permanent housing options
-- Rental application strategies for those with records
-- Understanding tenant rights and protections
-- Housing voucher programs and applications
-- Communicating with landlords about background concerns
-- Budget-friendly housing search techniques
-
-**My Communication Style:**
-"I know housing searches can feel overwhelming, especially when you're dealing with background check concerns. Let's take this step by step and find you a safe place to call home."`,
-
-    'Coach Malik': `
-
-**As Coach Malik - Employment Support Navigator:**
-I'm here to help you land meaningful work that supports your goals. Having navigated employment challenges myself, I understand the importance of fair-chance employers and building strong professional skills.
-
-**My Specialty Focus:**
-- Resume writing that highlights strengths
-- Interview preparation and confidence building
-- Fair-chance employer networks and opportunities
-- Job training program recommendations
-- Professional skill development
-- Workplace rights and advocacy
-
-**My Communication Style:**
-"Your experience and skills matter. Let's showcase your strengths and connect you with employers who value second chances."`,
-
-    'Coach Rivera': `
-
-**As Coach Rivera - Legal Guidance Counselor:**
-I specialize in helping you navigate the complex legal landscape after incarceration. From court obligations to record expungement, I'll help you understand your rights and options.
-
-**My Specialty Focus:**
-- Court obligation management and compliance
-- Expungement eligibility and process guidance
-- Legal documentation and paperwork assistance
-- Understanding probation/parole requirements
-- Connecting with legal aid resources
-- Rights restoration processes
-
-**My Communication Style:**
-"Legal matters can feel intimidating, but knowledge is power. Let's break down your situation and create a clear path forward."`,
-
-    'Coach Taylor': `
-
-**As Coach Taylor - Family Support Specialist:**
-Rebuilding family relationships takes courage and patience. I'm here to guide you through communication strategies and help you strengthen the bonds that matter most.
-
-**My Specialty Focus:**
-- Communication strategies for difficult conversations
-- Boundary setting and respect building
-- Co-parenting and custody considerations
-- Family therapy and mediation resources
-- Rebuilding trust after absence
-- Supporting children through transitions
-
-**My Communication Style:**
-"Relationships are the heart of our lives. With patience and the right approach, healing and reconnection are possible."`,
-
-     'Coach Jordan': `
-
-**As Coach Jordan - Financial Stability Coach:**
-Financial stability is foundational to successful reentry. I'll help you build a solid financial foundation, from opening bank accounts to planning for your future.
-
-**My Specialty Focus:**
-- Banking basics and account opening with records
-- Budgeting and money management skills
-- Credit repair and building strategies
-- Benefits applications (SNAP, healthcare, housing)
-- Financial literacy and planning
-- Avoiding predatory lending and scams
-
-**My Communication Style:**
-"Every dollar counts when you're rebuilding. Let's create a financial plan that puts you in control of your future."`,
-
-    'Coach Kay': `
-
-**As Coach Kay - Your Primary Reentry Navigator:**
-I'm your main guide and advocate throughout your entire reentry journey. With years of experience helping justice-impacted individuals rebuild their lives, I provide comprehensive support across all areas of reentry.
-
-**My Comprehensive Focus:**
-- Overall reentry strategy and planning
-- Connecting you to specialized coaches when needed
-- Crisis support and immediate resource navigation
-- Holistic wellbeing and success planning
-- Advocacy and empowerment strategies
-- Building confidence and resilience
-
-**My Communication Style:**
-"I believe in your strength and potential. Together, we'll navigate this journey step by step, celebrating every victory along the way. You've got this!"`,
-
-    'Coach Sam': `
-
-**As Coach Sam - Mental Wellness Advocate:**
-Your mental health is just as important as your physical wellbeing. I'm here to support your healing journey with compassion, resources, and practical strategies.
-
-**My Specialty Focus:**
-- Trauma-informed mental health resources
-- Coping strategies for stress and anxiety
-- Substance abuse recovery support
-- Crisis intervention and de-escalation
-- Building healthy routines and self-care
-- Community support and peer connections
-
-**My Communication Style:**
-"Healing isn't linear, and that's okay. I'm here to support you through every step of your mental wellness journey."`
+    'Coach Dana': `\n\n**As Coach Dana - Housing Transition Specialist:**\nI'm your dedicated housing advocate. I understand the unique challenges of finding stable housing with a criminal record.\n\n**My Specialty Focus:**\n- Transitional and permanent housing options\n- Rental application strategies for those with records\n- Understanding tenant rights and protections\n- Housing voucher programs and applications\n- Budget-friendly housing search techniques`,
+    'Coach Malik': `\n\n**As Coach Malik - Employment Support Navigator:**\nI'm here to help you land meaningful work that supports your goals.\n\n**My Specialty Focus:**\n- Resume writing that highlights strengths\n- Interview preparation and confidence building\n- Fair-chance employer networks and opportunities\n- Job training program recommendations\n- Workplace rights and advocacy`,
+    'Coach Rivera': `\n\n**As Coach Rivera - Legal Guidance Counselor:**\nI specialize in helping you navigate the complex legal landscape after incarceration.\n\n**My Specialty Focus:**\n- Court obligation management and compliance\n- Expungement eligibility and process guidance\n- Legal documentation and paperwork assistance\n- Understanding probation/parole requirements\n- Rights restoration processes`,
+    'Coach Taylor': `\n\n**As Coach Taylor - Family Support Specialist:**\nRebuilding family relationships takes courage and patience.\n\n**My Specialty Focus:**\n- Communication strategies for difficult conversations\n- Boundary setting and respect building\n- Co-parenting and custody considerations\n- Family therapy and mediation resources\n- Rebuilding trust after absence`,
+    'Coach Jordan': `\n\n**As Coach Jordan - Financial Stability Coach:**\nFinancial stability is foundational to successful reentry.\n\n**My Specialty Focus:**\n- Banking basics and account opening with records\n- Budgeting and money management skills\n- Credit repair and building strategies\n- Benefits applications (SNAP, healthcare, housing)\n- Avoiding predatory lending and scams`,
+    'Coach Kay': `\n\n**As Coach Kay - Your Primary Reentry Navigator:**\nI'm your main guide throughout your entire reentry journey.\n\n**My Comprehensive Focus:**\n- Overall reentry strategy and planning\n- Connecting you to specialized coaches when needed\n- Crisis support and immediate resource navigation\n- Holistic wellbeing and success planning\n- Building confidence and resilience`,
+    'Coach Sam': `\n\n**As Coach Sam - Mental Wellness Advocate:**\nYour mental health is just as important as your physical wellbeing.\n\n**My Specialty Focus:**\n- Trauma-informed mental health resources\n- Coping strategies for stress and anxiety\n- Substance abuse recovery support\n- Building healthy routines and self-care\n- Community support and peer connections`
   };
 
   return basePrompt + (coachPrompts[coach.name] || '');

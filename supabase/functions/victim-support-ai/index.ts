@@ -1,10 +1,11 @@
 import "https://deno.land/x/xhr@0.1.0/mod.ts";
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+import { checkAiRateLimit } from '../_shared/rate-limit.ts';
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version',
 };
 
 interface VictimSupportQuery {
@@ -14,62 +15,6 @@ interface VictimSupportQuery {
   victimType?: 'domestic_violence' | 'sexual_assault' | 'violent_crime' | 'property_crime' | 'other';
   traumaLevel?: 'recent' | 'ongoing' | 'past' | 'complex';
   previousContext?: Array<{role: string, content: string}>;
-}
-
-// Rate limiting configuration
-const RATE_LIMIT_MAX_REQUESTS = 10;
-const RATE_LIMIT_WINDOW_MINUTES = 5;
-
-async function checkRateLimit(supabase: any, identifier: string, endpoint: string): Promise<{ limited: boolean; remaining: number }> {
-  try {
-    const { data, error } = await supabase.rpc('check_ai_rate_limit', {
-      p_identifier: identifier,
-      p_endpoint: endpoint,
-      p_max_requests: RATE_LIMIT_MAX_REQUESTS,
-      p_window_minutes: RATE_LIMIT_WINDOW_MINUTES
-    });
-
-    if (error) {
-      console.error('Rate limit check error:', error);
-      return { limited: false, remaining: RATE_LIMIT_MAX_REQUESTS };
-    }
-
-    const result = data?.[0] || { is_rate_limited: false, current_count: 0 };
-    return {
-      limited: result.is_rate_limited,
-      remaining: Math.max(0, RATE_LIMIT_MAX_REQUESTS - result.current_count)
-    };
-  } catch (err) {
-    console.error('Rate limit error:', err);
-    return { limited: false, remaining: RATE_LIMIT_MAX_REQUESTS };
-  }
-}
-
-async function recordRequest(supabase: any, identifier: string, endpoint: string): Promise<void> {
-  try {
-    await supabase.rpc('record_ai_request', {
-      p_identifier: identifier,
-      p_endpoint: endpoint
-    });
-  } catch (err) {
-    console.error('Failed to record request:', err);
-  }
-}
-
-function getClientIdentifier(req: Request, authHeader: string | null): string {
-  if (authHeader && authHeader.startsWith('Bearer ')) {
-    try {
-      const token = authHeader.split(' ')[1];
-      const payload = JSON.parse(atob(token.split('.')[1]));
-      if (payload.sub) return `user:${payload.sub}`;
-    } catch (e) {
-      // Fall through to IP
-    }
-  }
-  
-  const forwarded = req.headers.get('x-forwarded-for');
-  const ip = forwarded ? forwarded.split(',')[0].trim() : 'unknown';
-  return `ip:${ip}`;
 }
 
 serve(async (req) => {
@@ -82,42 +27,25 @@ serve(async (req) => {
   const supabase = createClient(supabaseUrl, supabaseKey);
 
   try {
-    // Rate limiting check
-    const authHeader = req.headers.get('authorization');
-    const identifier = getClientIdentifier(req, authHeader);
-    const endpoint = 'victim-support-ai';
+    const OPENROUTER_API_KEY = Deno.env.get('OPENROUTER_API_KEY');
+    if (!OPENROUTER_API_KEY) {
+      throw new Error('OPENROUTER_API_KEY is not configured');
+    }
 
-    const rateLimit = await checkRateLimit(supabase, identifier, endpoint);
-    
+    const rateLimit = await checkAiRateLimit(supabase, req, 'victim-support-ai');
     if (rateLimit.limited) {
-      console.log(`Rate limit exceeded for ${identifier}`);
-      
-      await supabase.from('audit_logs').insert({
-        action: 'AI_RATE_LIMIT_EXCEEDED',
-        resource_type: 'ai_endpoint',
-        details: { endpoint, identifier },
-        severity: 'warn'
-      });
-
       return new Response(JSON.stringify({
         error: 'Rate limit exceeded. Please wait a few minutes before trying again.',
         supportMessage: 'For immediate victim support, please call the National Domestic Violence Hotline at 1-800-799-7233.',
-        retryAfter: RATE_LIMIT_WINDOW_MINUTES * 60
+        retryAfter: 300
       }), {
         status: 429,
-        headers: { 
-          ...corsHeaders, 
-          'Content-Type': 'application/json',
-          'Retry-After': String(RATE_LIMIT_WINDOW_MINUTES * 60)
-        },
+        headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Retry-After': '300' },
       });
     }
 
-    await recordRequest(supabase, identifier, endpoint);
-
     const { query, location, county, victimType, traumaLevel = 'ongoing', previousContext = [] }: VictimSupportQuery = await req.json();
 
-    // Enhanced resource filtering for victim services
     let resourceQuery = supabase
       .from('resources')
       .select('*')
@@ -136,7 +64,6 @@ serve(async (req) => {
       throw new Error('Failed to fetch resources');
     }
 
-    // Trauma-informed system prompt optimized for Ohio victim services
     const systemPrompt = `You are Coach Kay, the trauma-informed navigator for the Healing Hub at Forward Focus Elevation. You serve all 88 counties across Ohio, specializing in support for crime victims and survivors.
 
 ### Tone and Style
@@ -159,7 +86,7 @@ ${JSON.stringify(resources?.slice(0, 10) || [])}
 - Respect autonomy and provide hope while remaining realistic.
 - For immediate crisis, prioritize 988 or 911.
 
-Remember: You are the guide for healing and second chances. Be the "Google and Perplexity" for survivors by providing verified, structured resource information.`;
+Remember: You are the guide for healing and second chances. Provide verified, structured resource information.`;
 
     const messages = [
       { role: 'system', content: systemPrompt },
@@ -167,103 +94,52 @@ Remember: You are the guide for healing and second chances. Be the "Google and P
       { role: 'user', content: query }
     ];
 
-    const openAIResponse = await fetch('https://api.openai.com/v1/chat/completions', {
+    const aiResponse = await fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${Deno.env.get('OPENAI_API_KEY')}`,
+        'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+        'HTTP-Referer': 'https://forwardfocuselevation.org',
+        'X-Title': 'Forward Focus Elevation',
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: 'gpt-4.1-2025-04-14',
+        model: 'nousresearch/hermes-3-405b-instruct:free',
         messages,
-        max_completion_tokens: 1200,
+        stream: false,
+        max_tokens: 1200,
       }),
     });
 
-    if (!openAIResponse.ok) {
-      console.error('OpenAI API error:', await openAIResponse.text());
+    if (!aiResponse.ok) {
+      console.error('OpenRouter API error:', aiResponse.status, await aiResponse.text());
       throw new Error('Failed to generate AI response');
     }
 
-    const aiData = await openAIResponse.json();
+    const aiData = await aiResponse.json();
     const aiMessage = aiData.choices[0].message.content;
 
-    // Web Search Fallback (Perplexity)
-    let webResources: any[] = [];
-    const minResources = 3;
-    if ((resources?.length || 0) < minResources) {
-      try {
-        const perplexityResponse = await fetch('https://api.perplexity.ai/chat/completions', {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${Deno.env.get('PERPLEXITY_API_KEY')}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            model: 'llama-3.1-sonar-small-128k-online',
-            messages: [
-              { role: 'system', content: 'You are a victim services resource finder for Coach Kay at the Healing Hub. Find verified Ohio victim support organizations (name, phone, website, description) across all 88 counties. Prioritize Columbus and Franklin County if applicable. Return as structured JSON or a clear list.' },
-              { role: 'user', content: `Search for Ohio victim support related to: ${query} ${location ? 'near ' + location : ''} ${county ? 'in ' + county + ' County' : ''}` }
-            ],
-            max_tokens: 1000
-          }),
-        });
-
-        if (perplexityResponse.ok) {
-          const webData = await perplexityResponse.json();
-          webResources = [{
-            name: 'Latest Web Resources',
-            description: webData.choices[0].message.content,
-            type: 'web_search',
-            source: 'perplexity'
-          }];
-        }
-      } catch (err) {
-        console.error('Web search error:', err);
-      }
-    }
-
-    // Filter resources based on victim service needs
+    // Filter resources
     const relevantResources = resources?.filter(resource => {
       const queryLower = query.toLowerCase();
-      const resourceName = resource.name?.toLowerCase() || '';
-      const resourceDesc = resource.description?.toLowerCase() || '';
       const resourceType = resource.type?.toLowerCase() || '';
-      
-      // Victim service-specific resource matching
-      if (queryLower.includes('legal') || queryLower.includes('rights') || queryLower.includes('lawyer')) {
-        return resourceType.includes('legal aid') || resourceType.includes('advocacy');
-      }
-      if (queryLower.includes('compensation') || queryLower.includes('financial') || queryLower.includes('money')) {
-        return resourceType.includes('compensation') || resourceType.includes('financial');
-      }
-      if (queryLower.includes('counseling') || queryLower.includes('therapy') || queryLower.includes('trauma')) {
-        return resourceType.includes('counseling') || resourceType.includes('trauma') || resourceType.includes('mental health');
-      }
-      if (queryLower.includes('domestic violence') || queryLower.includes('abuse')) {
-        return resourceType.includes('domestic violence') || resourceName.includes('domestic');
-      }
-      if (queryLower.includes('sexual assault') || queryLower.includes('rape')) {
-        return resourceType.includes('sexual assault') || resourceName.includes('sexual');
-      }
-      
-      return resourceName.includes(queryLower) || 
-             resourceDesc.includes(queryLower) || 
-             resourceType.includes('victim') ||
-             resourceType.includes('advocacy');
+      if (queryLower.includes('legal') || queryLower.includes('rights')) return resourceType.includes('legal aid') || resourceType.includes('advocacy');
+      if (queryLower.includes('compensation') || queryLower.includes('financial')) return resourceType.includes('compensation') || resourceType.includes('financial');
+      if (queryLower.includes('counseling') || queryLower.includes('therapy')) return resourceType.includes('counseling') || resourceType.includes('trauma') || resourceType.includes('mental health');
+      if (queryLower.includes('domestic violence') || queryLower.includes('abuse')) return resourceType.includes('domestic violence');
+      if (queryLower.includes('sexual assault')) return resourceType.includes('sexual assault');
+      return resourceType.includes('victim') || resourceType.includes('advocacy');
     })?.slice(0, 8) || [];
 
     return new Response(JSON.stringify({
       response: aiMessage,
       resources: relevantResources,
-      webResources,
       victimType,
       traumaLevel,
       totalResources: resources?.length || 0,
       rateLimitRemaining: rateLimit.remaining - 1,
       supportServices: {
         domesticViolence: "1-800-799-7233",
-        sexualAssault: "1-800-656-4673", 
+        sexualAssault: "1-800-656-4673",
         crisisSupport: "988",
         ohioVictimCompensation: "https://www.ohioattorneygeneral.gov/Individuals-and-Families/Victims"
       }
@@ -273,12 +149,12 @@ Remember: You are the guide for healing and second chances. Be the "Google and P
 
   } catch (error) {
     console.error('Victim Support AI error:', error);
-    return new Response(JSON.stringify({ 
+    return new Response(JSON.stringify({
       error: 'I apologize for the technical difficulty. Let me connect you with local Ohio victim services and family justice centers in your area that can provide immediate support.',
       resources: [],
       supportServices: {
         domesticViolence: "1-800-799-7233",
-        sexualAssault: "1-800-656-4673", 
+        sexualAssault: "1-800-656-4673",
         crisisSupport: "988"
       }
     }), {

@@ -1,9 +1,11 @@
 import "https://deno.land/x/xhr@0.1.0/mod.ts";
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+import { checkAiRateLimit } from '../_shared/rate-limit.ts';
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version',
 };
 
 const PROMPTS = {
@@ -24,7 +26,6 @@ interface ChatMessage {
 interface ChatRequest {
   messages: ChatMessage[];
   topic: string;
-  stream?: boolean;
 }
 
 serve(async (req) => {
@@ -33,18 +34,16 @@ serve(async (req) => {
   }
 
   try {
-    const OPENAI_API_KEY = Deno.env.get('OPENAI_API_KEY');
-    if (!OPENAI_API_KEY) {
-      throw new Error('OPENAI_API_KEY is not configured');
+    const OPENROUTER_API_KEY = Deno.env.get('OPENROUTER_API_KEY');
+    if (!OPENROUTER_API_KEY) {
+      throw new Error('OPENROUTER_API_KEY is not configured');
     }
 
-    const { messages, topic, stream: shouldStream = true }: ChatRequest = await req.json();
+    const { messages, topic }: ChatRequest = await req.json();
 
     if (!topic || !PROMPTS[topic as TopicType]) {
       return new Response(
-        JSON.stringify({ 
-          error: 'Invalid or missing topic. Must be one of: resource-discovery, crisis-support, reentry-navigator, victim-support, youth-futures' 
-        }),
+        JSON.stringify({ error: 'Invalid or missing topic.' }),
         { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
@@ -56,24 +55,41 @@ serve(async (req) => {
       );
     }
 
+    const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
+    const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
+    const supabase = createClient(supabaseUrl, supabaseKey);
+
+    const rateLimit = await checkAiRateLimit(supabase, req, `chat-${topic}`);
+    if (rateLimit.limited) {
+      return new Response(JSON.stringify({
+        error: 'Rate limit exceeded. Please wait a few minutes.',
+        response: "You've reached your limit. Please try again shortly or sign in for more access."
+      }), {
+        status: 429,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+
     const systemPrompt = PROMPTS[topic as TopicType];
     const openAIMessages = [
       { role: "system", content: systemPrompt },
       ...messages
     ];
 
-    console.log(`Processing ${topic} chat request with ${messages.length} messages (stream: ${shouldStream})`);
+    console.log(`Processing ${topic} chat request with ${messages.length} messages`);
 
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${OPENAI_API_KEY}`,
+        'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+        'HTTP-Referer': 'https://forwardfocuselevation.org',
+        'X-Title': 'Forward Focus Elevation',
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: 'gpt-4o-mini',
+        model: 'meta-llama/llama-3.3-70b-instruct:free',
         messages: openAIMessages,
-        stream: shouldStream,
+        stream: false,
         temperature: 0.7,
         max_tokens: 1000,
       }),
@@ -81,36 +97,34 @@ serve(async (req) => {
 
     if (!response.ok) {
       const error = await response.text();
-      console.error('OpenAI API error:', error);
-      throw new Error(`OpenAI API error: ${response.status}`);
+      console.error('OpenRouter API error:', response.status, error);
+
+      if (response.status === 429) {
+        return new Response(JSON.stringify({ error: 'AI service is temporarily busy. Please try again in a moment.' }), {
+          status: 429, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
+      }
+      if (response.status === 402) {
+        return new Response(JSON.stringify({ error: 'AI service temporarily unavailable.' }), {
+          status: 402, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
+      }
+
+      throw new Error(`OpenRouter API error: ${response.status}`);
     }
 
-    if (!shouldStream) {
-      // Return JSON response directly for non-streaming requests
-      const data = await response.json();
-      const content = data.choices?.[0]?.message?.content || '';
-      return new Response(
-        JSON.stringify({ response: content }),
-        { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
+    const data = await response.json();
+    const content = data.choices?.[0]?.message?.content || '';
 
-    // Return streaming response
-    return new Response(response.body, {
-      headers: {
-        ...corsHeaders,
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive',
-      },
-    });
+    return new Response(
+      JSON.stringify({ response: content }),
+      { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+    );
 
   } catch (error) {
     console.error('Error in chat function:', error);
     return new Response(
-      JSON.stringify({ 
-        error: error instanceof Error ? error.message : 'Internal server error' 
-      }),
+      JSON.stringify({ error: error instanceof Error ? error.message : 'Internal server error' }),
       { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
   }

@@ -5,7 +5,7 @@ import { checkAiRateLimit } from '../_shared/rate-limit.ts';
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version',
 };
 
 interface EmergencyQuery {
@@ -21,22 +21,22 @@ serve(async (req) => {
     return new Response(null, { headers: corsHeaders });
   }
 
-  const startTime = Date.now();
-  let errorCount = 0;
-
   try {
+    const OPENROUTER_API_KEY = Deno.env.get('OPENROUTER_API_KEY');
+    if (!OPENROUTER_API_KEY) {
+      throw new Error('OPENROUTER_API_KEY is not configured');
+    }
+
     const { query, location, county, urgencyLevel = 'moderate', previousContext = [] }: EmergencyQuery = await req.json();
 
     const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
     const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
     const supabase = createClient(supabaseUrl, supabaseKey);
 
-    // Rate limiting check
     const rateLimit = await checkAiRateLimit(supabase, req, 'crisis-emergency-ai');
-
     if (rateLimit.limited) {
       return new Response(JSON.stringify({
-        error: "You've reached your daily limit for free AI consultations. For immediate support, please call 988 or 211. To get unlimited access to our AI tools, please sign in.",
+        error: "You've reached your daily limit for free AI consultations. For immediate support, please call 988 or 211.",
         resources: [],
         rateLimitExceeded: true
       }), {
@@ -45,7 +45,6 @@ serve(async (req) => {
       });
     }
 
-    // Enhanced resource filtering for emergency situations
     let resourceQuery = supabase
       .from('resources')
       .select('*')
@@ -64,7 +63,6 @@ serve(async (req) => {
       throw new Error('Failed to fetch resources');
     }
 
-    // Emergency-specific system prompt optimized for Ohio
     const systemPrompt = `You are Coach Kay, the lead Crisis Emergency navigator for Forward Focus Elevation. You serve all 88 counties across Ohio, providing immediate support and connecting users with the Healing Hub or emergency services.
 
 ### Tone and Style
@@ -74,7 +72,7 @@ serve(async (req) => {
 - Avoid conversational filler. Provide pure, structured, and informative output.
 
 ### Core Principles
-1. **Guided Interaction**: Always ask exactly ONE guided question at the end of your response to lead the user through their discovery or stabilization process.
+1. **Guided Interaction**: Always ask exactly ONE guided question at the end of your response.
 2. **Immediate Assessment**: Quickly assess the person's current situation and safety. Focus on immediate stabilization.
 3. **Ohio-Wide Support**: Prioritize local Ohio resources and emergency services across all 88 counties.
 4. **Sympathy & Alertness**: Be alert to danger signs and respond with professional sympathy and actionable help.
@@ -95,100 +93,45 @@ Remember: Safety first. Your role is to stabilize and connect users with verifie
       { role: 'user', content: query }
     ];
 
-    const openAIResponse = await fetch('https://api.openai.com/v1/chat/completions', {
+    const aiResponse = await fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${Deno.env.get('OPENAI_API_KEY')}`,
+        'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+        'HTTP-Referer': 'https://forwardfocuselevation.org',
+        'X-Title': 'Forward Focus Elevation',
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: 'gpt-4.1-2025-04-14',
+        model: 'google/gemma-3-27b-it:free',
         messages,
-        max_completion_tokens: 1000,
+        stream: false,
+        max_tokens: 1000,
       }),
     });
 
-    if (!openAIResponse.ok) {
-      console.error('OpenAI API error:', await openAIResponse.text());
-      errorCount++;
+    if (!aiResponse.ok) {
+      console.error('OpenRouter API error:', aiResponse.status, await aiResponse.text());
       throw new Error('Failed to generate AI response');
     }
 
-    const aiData = await openAIResponse.json();
+    const aiData = await aiResponse.json();
     const aiMessage = aiData.choices[0].message.content;
 
-    // Web Search Fallback (Perplexity)
-    let webResources: any[] = [];
-    if ((resources?.length || 0) < 2) {
-      try {
-        const perplexityResponse = await fetch('https://api.perplexity.ai/chat/completions', {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${Deno.env.get('PERPLEXITY_API_KEY')}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            model: 'llama-3.1-sonar-small-128k-online',
-            messages: [
-              { role: 'system', content: 'You are an emergency resource finder for Coach Kay at Forward Focus Elevation. Find verified Ohio crisis services (name, phone, website) across all 88 counties. Prioritize Columbus and Franklin County if applicable. Return as structured JSON or a clear list.' },
-              { role: 'user', content: `Search for immediate Ohio crisis support related to: ${query} ${location ? 'near ' + location : ''}` }
-            ],
-            max_tokens: 1000
-          }),
-        });
-
-        if (perplexityResponse.ok) {
-          const webData = await perplexityResponse.json();
-          webResources = [{
-            name: 'Latest Emergency Resources',
-            description: webData.choices[0].message.content,
-            type: 'web_search',
-            source: 'perplexity'
-          }];
-        }
-      } catch (err) {
-        console.error('Web search error:', err);
-      }
-    }
-
-    // Filter resources based on query context
     const relevantResources = resources?.filter(resource => {
       const queryLower = query.toLowerCase();
-      const resourceName = resource.name?.toLowerCase() || '';
-      const resourceDesc = resource.description?.toLowerCase() || '';
       const resourceType = resource.type?.toLowerCase() || '';
-      
-      // Emergency-specific resource matching
       if (queryLower.includes('crisis') || queryLower.includes('emergency') || queryLower.includes('help')) {
         return resourceType.includes('crisis') || resourceType.includes('emergency') || resourceType.includes('support');
       }
       if (queryLower.includes('mental health') || queryLower.includes('depression') || queryLower.includes('anxiety')) {
         return resourceType.includes('mental health') || resourceType.includes('counseling');
       }
-      
-      return resourceName.includes(queryLower) || 
-             resourceDesc.includes(queryLower) || 
-             resourceType.includes('crisis') ||
-             resourceType.includes('support');
+      return resourceType.includes('crisis') || resourceType.includes('support');
     })?.slice(0, 8) || [];
-
-    // Log usage analytics
-    const responseTime = Date.now() - startTime;
-    try {
-      await supabase.rpc('log_ai_usage', {
-        p_endpoint_name: 'crisis-emergency-ai',
-        p_user_id: null,
-        p_response_time_ms: responseTime,
-        p_error_count: errorCount
-      });
-    } catch (logError) {
-      console.error('Failed to log AI usage:', logError);
-    }
 
     return new Response(JSON.stringify({
       response: aiMessage,
       resources: relevantResources,
-      webResources,
       urgencyLevel,
       totalResources: resources?.length || 0
     }), {
@@ -197,26 +140,7 @@ Remember: Safety first. Your role is to stabilize and connect users with verifie
 
   } catch (error) {
     console.error('Crisis Emergency AI error:', error);
-    errorCount++;
-    
-    // Log error usage analytics  
-    const responseTime = Date.now() - startTime;
-    try {
-      const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
-      const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
-      const supabase = createClient(supabaseUrl, supabaseKey);
-      
-      await supabase.rpc('log_ai_usage', {
-        p_endpoint_name: 'crisis-emergency-ai',
-        p_user_id: null,
-        p_response_time_ms: responseTime,
-        p_error_count: errorCount
-      });
-    } catch (logError) {
-      console.error('Failed to log AI usage error:', logError);
-    }
-    
-    return new Response(JSON.stringify({ 
+    return new Response(JSON.stringify({
       error: 'I apologize for the technical difficulty. Let me connect you with local Ohio crisis support resources in your area.',
       resources: []
     }), {
