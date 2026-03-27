@@ -27,6 +27,9 @@ const AskCoachKay = () => {
   const [isOpen, setIsOpen] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [showEmailModal, setShowEmailModal] = useState(false);
+  const [guestMessageCount, setGuestMessageCount] = useState(0);
+  const [showNudge, setShowNudge] = useState(false);
+  const [trialExpired, setTrialExpired] = useState(false);
   const scrollAreaRef = useRef<HTMLDivElement>(null);
   const { toast } = useToast();
   const { openCalendly, calendlyReady } = useCalendlyPopup();
@@ -71,7 +74,7 @@ const AskCoachKay = () => {
       const supabaseKey = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY;
       
       if (!supabaseUrl || !supabaseKey) {
-        throw new Error('Ask Coach Kay is temporarily unavailable. Please try again later or use the static resources above.');
+        throw new Error('Ask Coach Kay is temporarily unavailable. Please try again later.');
       }
 
       const response = await fetch(`${supabaseUrl}/functions/v1/coach-k`, {
@@ -83,45 +86,40 @@ const AskCoachKay = () => {
         body: JSON.stringify({ messages: chatMessages })
       });
 
+      if (response.status === 429) {
+        setTrialExpired(true);
+        const data = await response.json();
+        setMessages(prev => {
+          const newMessages = [...prev];
+          const lastMessage = newMessages[newMessages.length - 1];
+          if (lastMessage.type === 'ai') {
+            lastMessage.content = data.response || "You've reached your message limit. Sign up for unlimited access!";
+          }
+          return newMessages;
+        });
+        return;
+      }
+
       if (!response.ok) {
         throw new Error(`HTTP error! status: ${response.status}`);
       }
 
-      const reader = response.body?.getReader();
-      if (!reader) throw new Error('No response body');
+      const data = await response.json();
+      const content = data.response || '';
 
-      const decoder = new TextDecoder();
-      let buffer = '';
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            const data = line.slice(6);
-            if (data === '[DONE]') continue;
-            try {
-              const parsed = JSON.parse(data);
-              const content = parsed.choices?.[0]?.delta?.content;
-              if (content) {
-                setMessages(prev => {
-                  const newMessages = [...prev];
-                  const lastMessage = newMessages[newMessages.length - 1];
-                  if (lastMessage.type === 'ai') {
-                    lastMessage.content += content;
-                  }
-                  return newMessages;
-                });
-                scrollToBottom();
-              }
-            } catch {
-              // Skip invalid JSON
-            }
-          }
-        }
+      // Track remaining for soft nudge
+      if (data.remaining !== undefined && data.remaining <= 3 && data.remaining > 0) {
+        setShowNudge(true);
       }
+
+      setMessages(prev => {
+        const newMessages = [...prev];
+        const lastMessage = newMessages[newMessages.length - 1];
+        if (lastMessage.type === 'ai') {
+          lastMessage.content = content;
+        }
+        return newMessages;
+      });
     } catch (error) {
       console.error('Coach Kay error:', error);
       const errorContent = error instanceof Error && error.message
@@ -140,7 +138,7 @@ const AskCoachKay = () => {
   };
 
   const handleSendMessage = async () => {
-    if (!inputMessage.trim() || isLoading) return;
+    if (!inputMessage.trim() || isLoading || trialExpired) return;
     const userMessage: Message = {
       id: Date.now().toString(),
       type: 'user',
@@ -151,6 +149,7 @@ const AskCoachKay = () => {
     const userInput = inputMessage;
     setInputMessage("");
     setIsLoading(true);
+    setGuestMessageCount(prev => prev + 1);
 
     const aiMessage: Message = {
       id: (Date.now() + 1).toString(),
@@ -210,6 +209,26 @@ const AskCoachKay = () => {
             </p>
           </div>
 
+          {/* Soft nudge banner */}
+          {showNudge && !trialExpired && (
+            <div className="bg-primary/10 border border-primary/20 px-4 py-2 mx-6 rounded-lg">
+              <p className="text-xs text-primary">
+                💡 You're getting close to the free limit. <a href="/register" className="underline font-semibold">Sign up</a> for unlimited access!
+              </p>
+            </div>
+          )}
+
+          {/* Trial expired banner */}
+          {trialExpired && (
+            <div className="bg-destructive/10 border border-destructive/20 px-4 py-3 mx-6 rounded-lg text-center">
+              <p className="text-sm font-semibold text-destructive mb-2">Free messages used up</p>
+              <p className="text-xs text-muted-foreground mb-3">Sign up to continue chatting with Coach Kay — it's free!</p>
+              <Button asChild size="sm" className="bg-primary text-primary-foreground">
+                <a href="/register">Create Free Account</a>
+              </Button>
+            </div>
+          )}
+
           <div className="space-y-4">
             <ScrollArea className="h-96 pr-4" ref={scrollAreaRef}>
               <div className="space-y-4">
@@ -235,15 +254,15 @@ const AskCoachKay = () => {
             <div className="space-y-1">
               <div className="flex gap-2">
                 <Input
-                  placeholder="What's going on today? How can I help?"
+                  placeholder={trialExpired ? "Sign up to continue chatting..." : "What's going on today? How can I help?"}
                   value={inputMessage}
                   onChange={e => setInputMessage(e.target.value)}
                   onKeyPress={e => e.key === 'Enter' && handleSendMessage()}
                   className="flex-1"
-                  disabled={isLoading}
+                  disabled={isLoading || trialExpired}
                   maxLength={MAX_MESSAGE_LENGTH}
                 />
-                <Button onClick={handleSendMessage} size="icon" disabled={isLoading}>
+                <Button onClick={handleSendMessage} size="icon" disabled={isLoading || trialExpired}>
                   <Send className="h-4 w-4" />
                 </Button>
               </div>

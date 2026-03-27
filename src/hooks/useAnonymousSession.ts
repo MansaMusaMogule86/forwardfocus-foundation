@@ -66,7 +66,7 @@ export const useAnonymousSession = (): UseAnonymousSessionReturn => {
 
       setSessionState({
         sessionToken,
-        turnsRemaining: Math.max(0, 5 - sessionData.usage_count),
+        turnsRemaining: Math.max(0, 10 - sessionData.usage_count),
         usageCount: sessionData.usage_count,
         trialExpired: sessionData.is_expired,
         isNewSession: sessionData.usage_count === 1
@@ -122,7 +122,7 @@ export const useAnonymousSession = (): UseAnonymousSessionReturn => {
     if (sessionToken) {
       setSessionState({
         sessionToken,
-        turnsRemaining: 5,
+        turnsRemaining: 10,
         usageCount: 0,
         trialExpired: false,
         isNewSession: true

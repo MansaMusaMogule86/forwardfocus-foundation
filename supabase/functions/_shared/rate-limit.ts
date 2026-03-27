@@ -1,7 +1,8 @@
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 
-export const GUEST_MAX_REQUESTS = 5;
+export const GUEST_MAX_REQUESTS = 10;
 export const AUTHED_MAX_REQUESTS = 50;
+export const SOFT_LIMIT_GUEST = 7;
 export const RATE_LIMIT_WINDOW_MINUTES = 1440; // 24 hours
 
 export async function checkAiRateLimit(supabase: any, req: Request, endpoint: string) {

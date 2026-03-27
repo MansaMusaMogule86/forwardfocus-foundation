@@ -5,7 +5,7 @@ import { checkAiRateLimit } from '../_shared/rate-limit.ts';
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version',
 };
 
 interface ChatMessage {
@@ -18,15 +18,14 @@ interface ChatRequest {
 }
 
 serve(async (req) => {
-  // Handle CORS preflight requests
   if (req.method === 'OPTIONS') {
     return new Response(null, { headers: corsHeaders });
   }
 
   try {
-    const OPENAI_API_KEY = Deno.env.get('OPENAI_API_KEY');
-    if (!OPENAI_API_KEY) {
-      throw new Error('OPENAI_API_KEY is not configured');
+    const OPENROUTER_API_KEY = Deno.env.get('OPENROUTER_API_KEY');
+    if (!OPENROUTER_API_KEY) {
+      throw new Error('OPENROUTER_API_KEY is not configured');
     }
 
     const { messages }: ChatRequest = await req.json();
@@ -39,37 +38,27 @@ serve(async (req) => {
     const rateLimit = await checkAiRateLimit(supabase, req, 'coach-k');
 
     if (rateLimit.limited) {
-      const errorStream = new ReadableStream({
-        start(controller) {
-          controller.enqueue(new TextEncoder().encode(`data: {"choices":[{"delta":{"content":"You've reached your daily limit for free AI consultations. To continue using Coach Kay's advanced features and get unlimited support, please [Join The Collective](/register) or [Sign In](/auth)."}}]}\n\n`));
-          controller.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
-          controller.close();
-        }
+      return new Response(JSON.stringify({
+        response: "You've reached your daily limit for free AI consultations. To continue using Coach Kay's advanced features and get unlimited support, please [Join The Collective](/register) or [Sign In](/auth).",
+        rateLimitExceeded: true,
+        remaining: 0
+      }), {
+        status: 429,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       });
-      return new Response(errorStream, { headers: { ...corsHeaders, 'Content-Type': 'text/event-stream' } });
     }
 
     // Validate messages
     if (!messages || !Array.isArray(messages) || messages.length === 0) {
-      const errorStream = new ReadableStream({
-        start(controller) {
-          controller.enqueue(new TextEncoder().encode(`data: {"choices":[{"delta":{"content":"Invalid request format. Please try again. Need more help? Reply here any time."}}]}\n\n`));
-          controller.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
-          controller.close();
-        }
-      });
-      
-      return new Response(errorStream, {
-        headers: {
-          ...corsHeaders,
-          'Content-Type': 'text/event-stream',
-          'Cache-Control': 'no-cache',
-          'Connection': 'keep-alive',
-        },
+      return new Response(JSON.stringify({
+        response: "Invalid request format. Please try again. Need more help? Reply here any time.",
+        error: true
+      }), {
+        status: 400,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       });
     }
 
-    // Prepare messages for OpenAI with Coach Kay system prompt
     const systemPrompt = `You are Coach Kay, the primary AI-powered navigator for Forward Focus Elevation. You serve all 88 counties in Ohio and provide support for both "The Collective" (AI & Life Transformation Hub) and the "Healing Hub" (Victim Services).
 
 ### Tone and Style
@@ -93,7 +82,7 @@ serve(async (req) => {
 - For immediate crisis, prioritize 988 or 911.
 
 Remember: You are the hub for second chances. Provide clear, actionable, and compassionate guidance.`;
-    
+
     const openAIMessages = [
       { role: "system", content: systemPrompt },
       ...messages
@@ -101,49 +90,18 @@ Remember: You are the hub for second chances. Provide clear, actionable, and com
 
     console.log(`Processing Coach K chat request with ${messages.length} messages`);
 
-    // Check if the latest message asks for resources/specific info that might need web search
-    const lastMessage = messages[messages.length - 1].content.toLowerCase();
-    const needsWebSearch = lastMessage.includes('find') || lastMessage.includes('search') || lastMessage.includes('resource') || lastMessage.includes('where');
-
-    if (needsWebSearch) {
-      try {
-        const perplexityResponse = await fetch('https://api.perplexity.ai/chat/completions', {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${Deno.env.get('PERPLEXITY_API_KEY')}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            model: 'llama-3.1-sonar-small-128k-online',
-            messages: [
-              { role: 'system', content: 'You are a resource assistant for Coach Kay at Forward Focus Elevation. Find verified Ohio resources (name, phone, website) across all 88 counties. Prioritize Columbus and Franklin County if applicable. Return a structured summary.' },
-              { role: 'user', content: `Search for Ohio resources related to: ${lastMessage}` }
-            ],
-            max_tokens: 600
-          }),
-        });
-
-        if (perplexityResponse.ok) {
-          const webData = await perplexityResponse.json();
-          const webSummary = webData.choices[0].message.content;
-          openAIMessages.push({ role: 'system', content: `Current web information for resources: ${webSummary}` });
-        }
-      } catch (err) {
-        console.error('Web search error in Coach K:', err);
-      }
-    }
-
-    // Call OpenAI API with streaming
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${OPENAI_API_KEY}`,
+        'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+        'HTTP-Referer': 'https://forwardfocuselevation.org',
+        'X-Title': 'Forward Focus Elevation',
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: 'gpt-4o-mini',
+        model: 'meta-llama/llama-3.3-70b-instruct:free',
         messages: openAIMessages,
-        stream: true,
+        stream: false,
         temperature: 0.7,
         max_tokens: 1000,
       }),
@@ -151,63 +109,49 @@ Remember: You are the hub for second chances. Provide clear, actionable, and com
 
     if (!response.ok) {
       const error = await response.text();
-      console.error('OpenAI API error:', error);
-      
-      let errorMessage = 'Service temporarily unavailable';
+      console.error('OpenRouter API error:', response.status, error);
+
       if (response.status === 429) {
-        errorMessage = 'Service busy - please try again in a moment';
-      } else if (response.status === 401) {
-        errorMessage = 'Authentication error - please try again';
+        return new Response(JSON.stringify({
+          response: "Our AI service is temporarily busy. Please try again in a moment. Need immediate help? Call 988 for crisis support or 211 for resources.",
+          rateLimitExceeded: true,
+          remaining: 0
+        }), {
+          status: 429,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
       }
-      
-      // Return streaming error response
-      const errorStream = new ReadableStream({
-        start(controller) {
-          controller.enqueue(new TextEncoder().encode(`data: {"choices":[{"delta":{"content":"${errorMessage}. Need more help? Reply here any time."}}]}\n\n`));
-          controller.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
-          controller.close();
-        }
-      });
-      
-      return new Response(errorStream, {
-        headers: {
-          ...corsHeaders,
-          'Content-Type': 'text/event-stream',
-          'Cache-Control': 'no-cache',
-          'Connection': 'keep-alive',
-        },
-      });
+      if (response.status === 402) {
+        return new Response(JSON.stringify({
+          response: "Our AI service is temporarily unavailable. Please try again later. For immediate support, call 988 or 211.",
+          remaining: 0
+        }), {
+          status: 402,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
+      }
+
+      throw new Error(`OpenRouter API error: ${response.status}`);
     }
 
-    // Return streaming response
-    return new Response(response.body, {
-      headers: {
-        ...corsHeaders,
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive',
-      },
+    const data = await response.json();
+    const content = data.choices?.[0]?.message?.content || '';
+
+    return new Response(JSON.stringify({
+      response: content,
+      remaining: rateLimit.remaining - 1
+    }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     });
 
   } catch (error) {
     console.error('Error in coach-k function:', error);
-    
-    // Return streaming error response for consistency
-    const errorStream = new ReadableStream({
-      start(controller) {
-        controller.enqueue(new TextEncoder().encode(`data: {"choices":[{"delta":{"content":"Sorry, I can't reach the server right now. Please try again in a moment. Need more help? Reply here any time."}}]}\n\n`));
-        controller.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
-        controller.close();
-      }
-    });
-    
-    return new Response(errorStream, {
-      headers: {
-        ...corsHeaders,
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive',
-      },
+    return new Response(JSON.stringify({
+      response: "Sorry, I can't reach the server right now. Please try again in a moment. Need more help? Book a free consult at https://calendly.com/ffe_coach_kay/free-call",
+      error: true
+    }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     });
   }
 });

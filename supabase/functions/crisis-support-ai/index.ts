@@ -1,10 +1,11 @@
 import "https://deno.land/x/xhr@0.1.0/mod.ts";
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+import { checkAiRateLimit } from '../_shared/rate-limit.ts';
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version',
 };
 
 interface CrisisQuery {
@@ -15,115 +16,37 @@ interface CrisisQuery {
   previousContext?: Array<{role: string, content: string}>;
 }
 
-// Rate limiting configuration
-const RATE_LIMIT_MAX_REQUESTS = 10;
-const RATE_LIMIT_WINDOW_MINUTES = 5;
-
-async function checkRateLimit(supabase: any, identifier: string, endpoint: string): Promise<{ limited: boolean; remaining: number }> {
-  try {
-    const { data, error } = await supabase.rpc('check_ai_rate_limit', {
-      p_identifier: identifier,
-      p_endpoint: endpoint,
-      p_max_requests: RATE_LIMIT_MAX_REQUESTS,
-      p_window_minutes: RATE_LIMIT_WINDOW_MINUTES
-    });
-
-    if (error) {
-      console.error('Rate limit check error:', error);
-      // Fail open - allow request if rate limit check fails
-      return { limited: false, remaining: RATE_LIMIT_MAX_REQUESTS };
-    }
-
-    const result = data?.[0] || { is_rate_limited: false, current_count: 0 };
-    return {
-      limited: result.is_rate_limited,
-      remaining: Math.max(0, RATE_LIMIT_MAX_REQUESTS - result.current_count)
-    };
-  } catch (err) {
-    console.error('Rate limit error:', err);
-    return { limited: false, remaining: RATE_LIMIT_MAX_REQUESTS };
-  }
-}
-
-async function recordRequest(supabase: any, identifier: string, endpoint: string): Promise<void> {
-  try {
-    await supabase.rpc('record_ai_request', {
-      p_identifier: identifier,
-      p_endpoint: endpoint
-    });
-  } catch (err) {
-    console.error('Failed to record request:', err);
-  }
-}
-
-function getClientIdentifier(req: Request, authHeader: string | null): string {
-  // Try to get user ID from JWT
-  if (authHeader && authHeader.startsWith('Bearer ')) {
-    try {
-      const token = authHeader.split(' ')[1];
-      const payload = JSON.parse(atob(token.split('.')[1]));
-      if (payload.sub) return `user:${payload.sub}`;
-    } catch (e) {
-      // Fall through to IP
-    }
-  }
-  
-  // Fall back to IP address
-  const forwarded = req.headers.get('x-forwarded-for');
-  const ip = forwarded ? forwarded.split(',')[0].trim() : 'unknown';
-  return `ip:${ip}`;
-}
-
 serve(async (req) => {
   if (req.method === 'OPTIONS') {
     return new Response(null, { headers: corsHeaders });
   }
 
-  const startTime = Date.now();
-  let errorCount = 0;
   const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
   const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
   const supabase = createClient(supabaseUrl, supabaseKey);
 
   try {
-    // Rate limiting check
-    const authHeader = req.headers.get('authorization');
-    const identifier = getClientIdentifier(req, authHeader);
-    const endpoint = 'crisis-support-ai';
+    const OPENROUTER_API_KEY = Deno.env.get('OPENROUTER_API_KEY');
+    if (!OPENROUTER_API_KEY) {
+      throw new Error('OPENROUTER_API_KEY is not configured');
+    }
 
-    const rateLimit = await checkRateLimit(supabase, identifier, endpoint);
-    
+    // Rate limiting
+    const rateLimit = await checkAiRateLimit(supabase, req, 'crisis-support-ai');
     if (rateLimit.limited) {
-      console.log(`Rate limit exceeded for ${identifier}`);
-      
-      // Log rate limit event
-      await supabase.from('audit_logs').insert({
-        action: 'AI_RATE_LIMIT_EXCEEDED',
-        resource_type: 'ai_endpoint',
-        details: { endpoint, identifier },
-        severity: 'warn'
-      });
-
       return new Response(JSON.stringify({
         error: 'Rate limit exceeded. Please wait a few minutes before trying again.',
         supportMessage: 'For immediate crisis support, please call 988 (Suicide & Crisis Lifeline) or 911.',
-        retryAfter: RATE_LIMIT_WINDOW_MINUTES * 60
+        retryAfter: 300
       }), {
         status: 429,
-        headers: { 
-          ...corsHeaders, 
-          'Content-Type': 'application/json',
-          'Retry-After': String(RATE_LIMIT_WINDOW_MINUTES * 60)
-        },
+        headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Retry-After': '300' },
       });
     }
 
-    // Record this request
-    await recordRequest(supabase, identifier, endpoint);
-
     const { query, location, county, urgencyLevel = 'moderate', previousContext = [] }: CrisisQuery = await req.json();
 
-    // Enhanced resource filtering for crisis situations
+    // Fetch crisis resources from DB
     let resourceQuery = supabase
       .from('resources')
       .select('*')
@@ -142,7 +65,6 @@ serve(async (req) => {
       throw new Error('Failed to fetch resources');
     }
 
-    // Crisis-specific system prompt optimized for Ohio residents
     const systemPrompt = `You are Coach Kay, the Crisis Support companion for the Healing Hub at Forward Focus Elevation, serving all 88 counties across Ohio. You specialize in immediate crisis intervention, safety planning, and connecting people with the "Healing Hub" for long-term support.
 
 ### Tone and Style
@@ -165,7 +87,7 @@ ${JSON.stringify(resources?.slice(0, 10) || [])}
 - For suicide/crisis support, emphasize 988.
 - For domestic violence, emphasize 1-800-799-7233.
 
-Remember: You are the companion for second chances and healing. Be the "Google and Perplexity" for those in need by providing verified, structured resource information.`;
+Remember: You are the companion for second chances and healing. Provide verified, structured resource information.`;
 
     const messages = [
       { role: 'system', content: systemPrompt },
@@ -173,27 +95,26 @@ Remember: You are the companion for second chances and healing. Be the "Google a
       { role: 'user', content: query }
     ];
 
-    const openAIResponse = await fetch('https://api.openai.com/v1/chat/completions', {
+    const aiResponse = await fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${Deno.env.get('OPENAI_API_KEY')}`,
+        'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+        'HTTP-Referer': 'https://forwardfocuselevation.org',
+        'X-Title': 'Forward Focus Elevation',
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: 'gpt-4.1-2025-04-14',
+        model: 'google/gemma-3-27b-it:free',
         messages,
-        max_completion_tokens: 1000,
+        stream: false,
+        max_tokens: 1000,
       }),
     });
 
-    // Filter resources based on query context and urgency
+    // Filter relevant resources
     const relevantResources = resources?.filter(resource => {
       const queryLower = query.toLowerCase();
-      const resourceName = resource.name?.toLowerCase() || '';
-      const resourceDesc = resource.description?.toLowerCase() || '';
       const resourceType = resource.type?.toLowerCase() || '';
-      
-      // Crisis-specific resource matching
       if (queryLower.includes('suicide') || queryLower.includes('self-harm')) {
         return resourceType.includes('crisis') || resourceType.includes('mental health');
       }
@@ -203,28 +124,14 @@ Remember: You are the companion for second chances and healing. Be the "Google a
       if (queryLower.includes('addiction') || queryLower.includes('substance')) {
         return resourceType.includes('substance abuse') || resourceType.includes('mental health');
       }
-      
-      return resourceName.includes(queryLower) || 
-             resourceDesc.includes(queryLower) || 
-             resourceType.includes('crisis') ||
-             resourceType.includes('emergency');
+      return resourceType.includes('crisis') || resourceType.includes('emergency');
     })?.slice(0, 8) || [];
 
-    if (!openAIResponse.ok) {
-      console.error('OpenAI API error:', await openAIResponse.text());
-      errorCount++;
-      
-      // Log usage analytics
-      const responseTime = Date.now() - startTime;
-      try {
-        await supabase.rpc('log_ai_usage', {
-          p_endpoint_name: 'crisis-support-ai',
-          p_user_id: null,
-          p_response_time_ms: responseTime,
-          p_error_count: errorCount
-        });
-      } catch (logError) {
-        console.error('Failed to log AI usage:', logError);
+    if (!aiResponse.ok) {
+      console.error('OpenRouter API error:', aiResponse.status, await aiResponse.text());
+
+      if (aiResponse.status === 429 || aiResponse.status === 402) {
+        // Still provide fallback with resources
       }
 
       const compassionateResponse = `I'm here with you, and I want you to know that you're not alone. While I'm having some technical difficulties right now, your wellbeing is my priority.
@@ -248,61 +155,12 @@ I'm searching for local Ohio resources that can provide you with immediate suppo
       });
     }
 
-    const aiData = await openAIResponse.json();
+    const aiData = await aiResponse.json();
     const aiMessage = aiData.choices[0].message.content;
-
-    // Web Search Fallback (Perplexity)
-    let webResources: any[] = [];
-    const minResources = 2;
-    if ((resources?.length || 0) < minResources) {
-      try {
-        const perplexityResponse = await fetch('https://api.perplexity.ai/chat/completions', {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${Deno.env.get('PERPLEXITY_API_KEY')}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            model: 'llama-3.1-sonar-small-128k-online',
-            messages: [
-              { role: 'system', content: 'You are a crisis resource finder for Coach Kay at the Healing Hub. Find verified Ohio crisis support organizations (name, phone, website, description) across all 88 counties. Prioritize Columbus and Franklin County if applicable. Return as structured JSON or a clear list.' },
-              { role: 'user', content: `Search for Ohio crisis support related to: ${query} ${location ? 'near ' + location : ''} ${county ? 'in ' + county + ' County' : ''}` }
-            ],
-            max_tokens: 1000
-          }),
-        });
-
-        if (perplexityResponse.ok) {
-          const webData = await perplexityResponse.json();
-          webResources = [{
-            name: 'Latest Crisis Resources',
-            description: webData.choices[0].message.content,
-            type: 'web_search',
-            source: 'perplexity'
-          }];
-        }
-      } catch (err) {
-        console.error('Web search error:', err);
-      }
-    }
-
-    // Log usage analytics
-    const responseTime = Date.now() - startTime;
-    try {
-      await supabase.rpc('log_ai_usage', {
-        p_endpoint_name: 'crisis-support-ai',
-        p_user_id: null,
-        p_response_time_ms: responseTime,
-        p_error_count: errorCount
-      });
-    } catch (logError) {
-      console.error('Failed to log AI usage:', logError);
-    }
 
     return new Response(JSON.stringify({
       response: aiMessage,
       resources: relevantResources,
-      webResources,
       urgencyLevel,
       totalResources: resources?.length || 0,
       rateLimitRemaining: rateLimit.remaining - 1
@@ -312,33 +170,15 @@ I'm searching for local Ohio resources that can provide you with immediate suppo
 
   } catch (error) {
     console.error('Crisis Support AI error:', error);
-    errorCount++;
-    
-    // Log error usage analytics  
-    const responseTime = Date.now() - startTime;
-    try {
-      await supabase.rpc('log_ai_usage', {
-        p_endpoint_name: 'crisis-support-ai',
-        p_user_id: null,
-        p_response_time_ms: responseTime,
-        p_error_count: errorCount
-      });
-    } catch (logError) {
-      console.error('Failed to log AI usage error:', logError);
-    }
-    
-    // Emergency fallback: Return supportive message with any available resources
+
     const fallbackMessage = `I am here to support you. While I am experiencing technical difficulties, your safety is the highest priority.
 
 ## Immediate Crisis Support
 - **Emergency:** Call 911
 - **Suicide & Crisis Lifeline:** Call 988
 - **Crisis Text Line:** Text HOME to 741741
-- **Domestic Violence Hotline:** Call 1-800-799-7233
+- **Domestic Violence Hotline:** Call 1-800-799-7233`;
 
-I am continuing to search for local Ohio resources to assist you.`;
-
-    // Try to get basic crisis resources as fallback
     let fallbackResources = [];
     try {
       const { data: dbResources } = await supabase
@@ -352,7 +192,7 @@ I am continuing to search for local Ohio resources to assist you.`;
       console.error('Fallback database error:', dbError);
     }
 
-    return new Response(JSON.stringify({ 
+    return new Response(JSON.stringify({
       response: fallbackMessage,
       resources: fallbackResources,
       urgencyLevel: 'urgent',
